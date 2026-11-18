@@ -35,6 +35,10 @@
 #include <string>
 #include <vector>
 
+namespace transcribe {
+class Tokenizer;
+}
+
 namespace transcribe::parakeet {
 
 struct ParakeetModel;
@@ -203,6 +207,38 @@ struct TdtToken {
     int   duration_frames = 0;
 };
 
+// What the transducer decoders hand back for vocabulary rescoring
+// (vocabulary.h), so it reuses their work instead of redoing it:
+//   enc_proj     the per-frame joint encoder projections, [T, joint_h]
+//                row-major, absolute frame enc_proj_first_frame first.
+//   checkpoints  the predictor before every k_checkpoint_every-th
+//                emitted token (its LSTM state and previous token as the
+//                decoder held them), so rescoring a span replays at most
+//                k_checkpoint_every - 1 predictor steps.
+// The offline decoders fill a fresh capture; the streaming decoder
+// appends to one.
+struct PredictorCheckpoint {
+    int       token      = 0;  // index into the decoder's out_tokens
+    int       last_token = -1;
+    LstmState state;
+};
+
+struct DecodeCapture {
+    static constexpr int k_checkpoint_every = 8;
+
+    std::vector<float>               enc_proj;
+    int64_t                          enc_proj_first_frame = 0;
+    std::vector<PredictorCheckpoint> checkpoints;
+
+    void clear() {
+        enc_proj.clear();
+        enc_proj.shrink_to_fit();
+        enc_proj_first_frame = 0;
+        checkpoints.clear();
+        checkpoints.shrink_to_fit();
+    }
+};
+
 // Run TDT greedy decode end-to-end against an encoder output buffer.
 //
 // Inputs:
@@ -223,7 +259,8 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        T_enc,
                                     int                        d_enc,
                                     int                        n_threads,
-                                    std::vector<TdtToken> &    out_tokens);
+                                    std::vector<TdtToken> &    out_tokens,
+                                    DecodeCapture *            capture = nullptr);
 
 // Run RNNT greedy decode end-to-end. Same predictor + joint code as TDT,
 // but the joint emits `vocab+1` logits (no duration extras) and the step
@@ -235,7 +272,8 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        T_enc,
                                      int                        d_enc,
                                      int                        n_threads,
-                                     std::vector<TdtToken> &    out_tokens);
+                                     std::vector<TdtToken> &    out_tokens,
+                                     DecodeCapture *            capture = nullptr);
 
 // Streaming variant of RNN-T greedy decode. Consumes T_enc_new encoder
 // frames (the chunk just produced) and APPENDS emitted tokens to
@@ -252,7 +290,11 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int &                      last_token_io,
                                                int                        frame_offset,
                                                int                        n_threads,
-                                               std::vector<TdtToken> &    out_tokens);
+                                               std::vector<TdtToken> &    out_tokens,
+                                               DecodeCapture *            capture = nullptr);
+
+// capture: when non-null, filled (offline) or appended to (streaming) for
+// vocabulary rescoring; see DecodeCapture.
 
 // Run CTC greedy decode end-to-end. Per-frame: logits = W @ enc[t] + b,
 // argmax; collapse rule "drop adjacent duplicates, then drop blanks"
@@ -265,5 +307,50 @@ transcribe_status decode_ctc_greedy(const HostDecoderWeights & w,
                                     int                        d_enc,
                                     int                        n_threads,
                                     std::vector<TdtToken> &    out_tokens);
+
+struct VocabularyBias;
+struct VocabularyTree;
+
+struct TreeOptions {
+    // nats per piece of a vocabulary term on a span greedy decoding spelled
+    // some other way
+    float boost = 1.5f;
+    // nats per piece when the greedy span also matches the term's consonant
+    // skeleton or sounds-like rules (0 uses `boost`)
+    float skeleton_boost = 0.0f;
+};
+
+// TreeOptions::boost as a share of the vocabulary boost (measured at 2.5).
+constexpr float k_tree_boost_ratio = 0.6f;
+
+// RNN-T greedy backbone with local vocabulary-tree branching: ordinary speech
+// follows the exact greedy trajectory (never dropping phrases or drifting on
+// non-term words), while acoustically plausible entries into `bias.tree` walk
+// the trie in shadow hypotheses and replace the greedy span only if a complete
+// term wins at the word boundary.
+transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
+                                   const transcribe::Tokenizer & tok,
+                                   const float *                 enc_out,
+                                   int                           T_enc,
+                                   int                           d_enc,
+                                   int                           n_threads,
+                                   const TreeOptions &           options,
+                                   const VocabularyBias &        bias,
+                                   std::vector<TdtToken> &       out_tokens,
+                                   DecodeCapture *               capture = nullptr);
+
+// Vocabulary rescoring (vocabulary.h) of the tokens a decoder emitted
+// into `capture`. Ordinary spans whose window falls outside the captured
+// frames, or before its first checkpoint, are left alone; exact sounds-like
+// spelling spans are replaced without scoring even when no window is
+// available. Rewrites `tokens` in place: each accepted span's tokens become
+// the term's pieces, spread over the span's frames. No-op for CTC heads or
+// an inactive bias.
+transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
+                                     const transcribe::Tokenizer & tok,
+                                     const VocabularyBias &        bias,
+                                     const DecodeCapture &         capture,
+                                     int                           n_threads,
+                                     std::vector<TdtToken> &       tokens);
 
 }  // namespace transcribe::parakeet

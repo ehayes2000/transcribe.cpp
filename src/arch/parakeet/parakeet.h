@@ -15,6 +15,7 @@
 #include "transcribe-model.h"
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
+#include "vocabulary.h"
 #include "weights.h"
 
 #include <cstdint>
@@ -335,6 +336,11 @@ struct ParakeetSession final : public transcribe_session {
     // clear_result (the family owns its per-utterance audio scratch).
     std::vector<float>    stream_pcm_buffer;
     transcribe_run_params stream_run_params{};
+    // Vocabulary compiled at stream_begin, and the joint encoder
+    // projections retained for rescoring at finalize (bounded; see
+    // stream_capture_sink in model.cpp).
+    VocabularyBias        stream_vocabulary;
+    DecodeCapture         stream_capture;
     // Convert from cumulative samples so odd feed sizes do not lose fractions.
     int64_t               stream_audio_input_samples = 0;
 

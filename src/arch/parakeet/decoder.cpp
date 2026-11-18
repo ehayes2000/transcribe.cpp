@@ -17,6 +17,7 @@
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
 #include "transcribe-log.h"
+#include "vocabulary.h"
 #include "weights.h"
 
 // ggml-backend.h, not ggml-cpu.h: under GGML_BACKEND_DL the CPU backend
@@ -43,6 +44,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1020,7 +1023,8 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        T_enc,
                                     int                        d_enc,
                                     int                        n_threads,
-                                    std::vector<TdtToken> &    out_tokens) {
+                                    std::vector<TdtToken> &    out_tokens,
+                                    DecodeCapture *            capture) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1167,6 +1171,9 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = step;
             tok.duration_frames = duration;
+            if (capture != nullptr && out_tokens.size() % DecodeCapture::k_checkpoint_every == 0) {
+                capture->checkpoints.push_back({ static_cast<int>(out_tokens.size()), last_token, state });
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1222,6 +1229,10 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                 max_iters);
         return TRANSCRIBE_ERR_BACKEND;
     }
+    if (capture != nullptr) {
+        capture->enc_proj             = std::move(enc_proj_all);
+        capture->enc_proj_first_frame = 0;
+    }
     return TRANSCRIBE_OK;
 }
 
@@ -1254,7 +1265,8 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        T_enc,
                                      int                        d_enc,
                                      int                        n_threads,
-                                     std::vector<TdtToken> &    out_tokens) {
+                                     std::vector<TdtToken> &    out_tokens,
+                                     DecodeCapture *            capture) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1372,6 +1384,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = step;
             tok.duration_frames = 1;
+            if (capture != nullptr && out_tokens.size() % DecodeCapture::k_checkpoint_every == 0) {
+                capture->checkpoints.push_back({ static_cast<int>(out_tokens.size()), last_token, state });
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1400,6 +1415,10 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                 max_iters);
         return TRANSCRIBE_ERR_BACKEND;
     }
+    if (capture != nullptr) {
+        capture->enc_proj             = std::move(enc_proj_all);
+        capture->enc_proj_first_frame = 0;
+    }
     return TRANSCRIBE_OK;
 }
 
@@ -1419,7 +1438,8 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int &                      last_token_io,
                                                int                        frame_offset,
                                                int                        n_threads,
-                                               std::vector<TdtToken> &    out_tokens) {
+                                               std::vector<TdtToken> &    out_tokens,
+                                               DecodeCapture *            capture) {
     if (enc_out == nullptr || T_enc_new <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1533,6 +1553,9 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = frame_offset + step;
             tok.duration_frames = 1;
+            if (capture != nullptr && out_tokens.size() % DecodeCapture::k_checkpoint_every == 0) {
+                capture->checkpoints.push_back({ static_cast<int>(out_tokens.size()), last_token, state });
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
@@ -1556,6 +1579,10 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     // non-blank state (the predictor's "current" since the last emit).
     state_io      = std::move(state);
     last_token_io = last_token;
+    if (capture != nullptr) {
+        capture->enc_proj.insert(capture->enc_proj.end(), enc_proj_all.begin(),
+                                 enc_proj_all.begin() + static_cast<std::ptrdiff_t>(T_enc_new) * joint_h);
+    }
     return TRANSCRIBE_OK;
 }
 
@@ -1681,6 +1708,1561 @@ transcribe_status decode_ctc_greedy(const HostDecoderWeights & w,
     log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "decoder (ctc): T_enc=%d  proj=%.1f ms  emitted=%d", T_enc, t_proj_us / 1000.0,
             static_cast<int>(out_tokens.size()));
 
+    return TRANSCRIBE_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Vocabulary rescoring (see vocabulary.h)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr double k_neg_inf = -1e30;
+
+double log_add(double a, double b) {
+    if (a <= k_neg_inf) {
+        return b;
+    }
+    if (b <= k_neg_inf) {
+        return a;
+    }
+    const double hi = std::max(a, b);
+    return hi + std::log1p(std::exp(std::min(a, b) - hi));
+}
+
+// The joint over a window of W encoder frames for one predictor output:
+// logits[joint_n, W] = out_w @ act(enc_proj[:, t] + pred_proj) + out_b.
+// Built per window on the decoder pool; enc_in is set once, pred_in per
+// predictor output.
+struct WindowJoint {
+    ggml_context *        ctx     = nullptr;
+    ggml_backend_t        backend = nullptr;  // BORROWED
+    ggml_backend_buffer_t buf     = nullptr;
+    ggml_cgraph *         graph   = nullptr;
+    ggml_tensor *         enc_in  = nullptr;
+    ggml_tensor *         pred_in = nullptr;
+    ggml_tensor *         logits  = nullptr;
+    int                   W       = 0;
+
+    WindowJoint() = default;
+
+    ~WindowJoint() {
+        if (buf != nullptr) {
+            safe_buffer_free(buf);
+        }
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+    }
+
+    WindowJoint(const WindowJoint &)             = delete;
+    WindowJoint & operator=(const WindowJoint &) = delete;
+};
+
+bool build_window_joint(WindowJoint & g, const HostJoint & j, ggml_backend_t backend, int W) {
+    g.backend = backend;
+    g.W       = W;
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    g.ctx         = ggml_init(ip);
+    if (g.ctx == nullptr) {
+        return false;
+    }
+    g.enc_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, j.joint_h, W);
+    ggml_set_input(g.enc_in);
+    g.pred_in = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, j.pred_hidden);
+    ggml_set_input(g.pred_in);
+    ggml_tensor * pred_proj = ggml_add(g.ctx, ggml_mul_mat(g.ctx, j.g_pred_w, g.pred_in), j.g_pred_b);
+    ggml_tensor * summed    = ggml_add(g.ctx, g.enc_in, pred_proj);  // [joint_h] broadcast over W
+    ggml_tensor * activated;
+    if (j.activation == "relu") {
+        activated = ggml_relu(g.ctx, summed);
+    } else if (j.activation == "sigmoid") {
+        activated = ggml_sigmoid(g.ctx, summed);
+    } else {
+        activated = ggml_tanh(g.ctx, summed);
+    }
+    g.logits = ggml_add(g.ctx, ggml_mul_mat(g.ctx, j.gw_w, activated), j.gw_b);  // [joint_n, W]
+    ggml_set_output(g.logits);
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, backend);
+    if (g.buf == nullptr) {
+        return false;
+    }
+    g.graph = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.graph, g.logits);
+    return true;
+}
+
+double log_sum_exp(const float * v, int n) {
+    float hi = v[0];
+    for (int i = 1; i < n; ++i) {
+        hi = std::max(hi, v[i]);
+    }
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        sum += std::exp(static_cast<double>(v[i] - hi));
+    }
+    return static_cast<double>(hi) + std::log(sum);
+}
+
+struct PredictorSnapshot {
+    LstmState state;
+    int       last_token = -1;
+};
+
+struct WindowScorer {
+    const HostDecoderWeights & w;
+    PredGraph &                pg;
+    WindowJoint &              joint;
+    std::vector<float>         scratch_x;
+    std::vector<float>         logits;
+    int64_t                    joint_columns = 0;
+
+    // log P(ids | frames [s, s + W)) under the transducer, starting from
+    // `start`. RNN-T: every alignment that has emitted all of `ids` when it
+    // reaches the window's last frame, then emits next_id there (or blank
+    // when next_id < 0). TDT: every alignment that has emitted all of `ids`
+    // by the last frame, with token and duration probabilities; arrivals
+    // that jump past the last frame count as reaching it.
+    //
+    // Every alignment emits each id once at some frame and pays nothing
+    // positive elsewhere, so the sum of each id's best frame bounds the
+    // result. Once that bound falls below `floor`, scoring stops and `out`
+    // is the bound (a term that cannot win costs only the rows it lost on).
+    bool score(const PredictorSnapshot &    start,
+               const std::vector<int32_t> & ids,
+               int                          next_id,
+               double                       floor,
+               double &                     out) {
+        const int  W           = joint.W;
+        const int  U           = static_cast<int>(ids.size());
+        const int  n_token_cls = w.predictor.pred_vocab;
+        const int  joint_n     = w.joint.joint_n;
+        const bool tdt         = w.head_kind == HostHeadKind::TDT;
+        const int  n_dur       = tdt ? static_cast<int>(w.tdt_durations.size()) : 0;
+        const int  blank       = w.blank_id;
+
+        // lp_blank[u][t], lp_tok[u][t], lp_dur[(u*W + t)*n_dur + k]
+        std::vector<double> lp_blank(static_cast<size_t>((U + 1) * W), k_neg_inf);
+        std::vector<double> lp_tok(static_cast<size_t>((U + 1) * W), k_neg_inf);
+        std::vector<double> lp_dur(static_cast<size_t>((U + 1) * W * std::max(n_dur, 1)), k_neg_inf);
+        double              lp_next = k_neg_inf;
+
+        LstmState state = start.state;
+        LstmState next_state;
+        next_state.reset(static_cast<int>(w.predictor.lstm.size()), w.predictor.pred_hidden);
+        int token = start.last_token;
+        logits.resize(static_cast<size_t>(joint_n) * static_cast<size_t>(W));
+        double bound = 0.0;
+        for (int u = 0; u <= U; ++u) {
+            const float * g = predictor_step_ggml(w.predictor, pg, token, state, next_state, scratch_x);
+            if (g == nullptr) {
+                return false;
+            }
+            ggml_backend_tensor_set(joint.pred_in, g, 0, static_cast<size_t>(w.joint.pred_hidden) * sizeof(float));
+            if (ggml_backend_graph_compute(joint.backend, joint.graph) != GGML_STATUS_SUCCESS) {
+                return false;
+            }
+            ggml_backend_tensor_get(joint.logits, logits.data(), 0, logits.size() * sizeof(float));
+            joint_columns += W;
+            for (int t = 0; t < W; ++t) {
+                const float * col = logits.data() + static_cast<size_t>(t) * static_cast<size_t>(joint_n);
+                const double  lse = log_sum_exp(col, n_token_cls);
+                const size_t  ut  = static_cast<size_t>(u * W + t);
+                lp_blank[ut]      = col[blank] - lse;
+                if (u < U) {
+                    lp_tok[ut] = col[ids[static_cast<size_t>(u)]] - lse;
+                }
+                if (tdt) {
+                    const double dlse = log_sum_exp(col + n_token_cls, n_dur);
+                    for (int k = 0; k < n_dur; ++k) {
+                        lp_dur[ut * static_cast<size_t>(n_dur) + static_cast<size_t>(k)] = col[n_token_cls + k] - dlse;
+                    }
+                } else if (u == U && t == W - 1) {
+                    lp_next = next_id >= 0 ? col[next_id] - lse : lp_blank[ut];
+                }
+            }
+            if (u < U) {
+                double best = k_neg_inf;
+                for (int t = 0; t < W; ++t) {
+                    best = std::max(best, lp_tok[static_cast<size_t>(u * W + t)]);
+                }
+                bound += best;
+                if (bound < floor) {
+                    out = bound;
+                    return true;
+                }
+            }
+            std::swap(state, next_state);
+            if (u < U) {
+                token = ids[static_cast<size_t>(u)];
+            }
+        }
+
+        if (!tdt) {
+            // alpha[t][u]: emitted ids[0..u) and standing on frame t.
+            std::vector<double> alpha(static_cast<size_t>((U + 1) * W), k_neg_inf);
+            for (int t = 0; t < W; ++t) {
+                for (int u = 0; u <= U; ++u) {
+                    double a = (t == 0 && u == 0) ? 0.0 : k_neg_inf;
+                    if (t > 0) {
+                        a = log_add(a, alpha[static_cast<size_t>((t - 1) * (U + 1) + u)] +
+                                           lp_blank[static_cast<size_t>(u * W + t - 1)]);
+                    }
+                    if (u > 0) {
+                        a = log_add(a, alpha[static_cast<size_t>(t * (U + 1) + u - 1)] +
+                                           lp_tok[static_cast<size_t>((u - 1) * W + t)]);
+                    }
+                    alpha[static_cast<size_t>(t * (U + 1) + u)] = a;
+                }
+            }
+            out = alpha[static_cast<size_t>((W - 1) * (U + 1) + U)] + lp_next;
+            return true;
+        }
+
+        // TDT: expand from every frame; a jump to or past the last frame
+        // with all ids emitted ends the alignment (blank jumps from the
+        // last frame itself are not taken, so nothing is counted twice).
+        int max_dur = 0;
+        for (const int32_t d : w.tdt_durations) {
+            max_dur = std::max(max_dur, static_cast<int>(d));
+        }
+        const int           T2 = W + max_dur;
+        std::vector<double> alpha(static_cast<size_t>((U + 1) * T2), k_neg_inf);
+        alpha[0]   = 0.0;
+        double end = k_neg_inf;
+        for (int t = 0; t < W; ++t) {
+            for (int u = 0; u <= U; ++u) {
+                const double a = alpha[static_cast<size_t>(t * (U + 1) + u)];
+                if (a <= k_neg_inf) {
+                    continue;
+                }
+                const size_t ut = static_cast<size_t>(u * W + t);
+                for (int k = 0; k < n_dur; ++k) {
+                    const int    d  = w.tdt_durations[static_cast<size_t>(k)];
+                    const double ld = lp_dur[ut * static_cast<size_t>(n_dur) + static_cast<size_t>(k)];
+                    if (u < U) {
+                        auto & dst = alpha[static_cast<size_t>((t + d) * (U + 1) + u + 1)];
+                        dst        = log_add(dst, a + lp_tok[ut] + ld);
+                    }
+                    if (d > 0 && !(u == U && t == W - 1)) {
+                        auto & dst = alpha[static_cast<size_t>((t + d) * (U + 1) + u)];
+                        dst        = log_add(dst, a + lp_blank[ut] + ld);
+                    }
+                }
+            }
+        }
+        for (int t = W - 1; t < T2; ++t) {
+            end = log_add(end, alpha[static_cast<size_t>(t * (U + 1) + U)]);
+        }
+        out = end;
+        return true;
+    }
+};
+
+struct ScoredCandidate {
+    VocabularyCandidate c;
+    double              gain = 0.0;
+};
+
+}  // namespace
+
+transcribe_status rescore_vocabulary(const HostDecoderWeights &    w,
+                                     const transcribe::Tokenizer & tok,
+                                     const VocabularyBias &        bias,
+                                     const DecodeCapture &         capture,
+                                     int                           n_threads,
+                                     std::vector<TdtToken> &       tokens) {
+    const int64_t joint_h  = w.joint.joint_h;
+    const int     n_frames = joint_h > 0 ? static_cast<int>(capture.enc_proj.size() / static_cast<size_t>(joint_h)) : 0;
+    if (!bias.active() || tokens.empty() || w.head_kind == HostHeadKind::CTC) {
+        return TRANSCRIBE_OK;
+    }
+    const int64_t                          t_start    = ggml_time_us();
+    const std::vector<VocabularyWord>      words      = vocabulary_words(tok, tokens);
+    const std::vector<VocabularyCandidate> candidates = find_vocabulary_candidates(words, bias);
+    if (candidates.empty()) {
+        return TRANSCRIBE_OK;
+    }
+
+    // Exact spellings need no scores and never enter the acoustic
+    // comparison. Resolve them first so they win any overlap with an
+    // ordinary candidate, then score only the candidates that remain.
+    const std::vector<VocabularyCandidate> spellings = resolve_vocabulary_spellings(candidates, words, bias);
+    std::vector<VocabularyCandidate>       scored_candidates;
+    for (const VocabularyCandidate & c : candidates) {
+        if (c.spelling) {
+            continue;
+        }
+        bool overlaps_spelling = false;
+        for (const VocabularyCandidate & s : spellings) {
+            overlaps_spelling = overlaps_spelling || (c.first < s.end && s.first < c.end);
+        }
+        if (!overlaps_spelling) {
+            scored_candidates.push_back(c);
+        }
+    }
+
+    std::vector<ScoredCandidate> accepted;
+    int64_t                      joint_columns = 0;
+    int                          scored        = 0;
+    int64_t                      t_replayed    = t_start;
+    if (!scored_candidates.empty() && n_frames > 0 && !capture.checkpoints.empty()) {
+        const float * enc_proj             = capture.enc_proj.data();
+        const int64_t enc_proj_first_frame = capture.enc_proj_first_frame;
+
+        // Predictor state before each candidate's first token: the decoder's
+        // nearest checkpoint at or before it, stepped through the tokens in
+        // between (the same lazy state machine as the decoders). A candidate
+        // before the first retained checkpoint is not rescored.
+        std::vector<int> needed;
+        for (const VocabularyCandidate & c : scored_candidates) {
+            if (c.first >= capture.checkpoints.front().token) {
+                needed.push_back(c.first);
+            }
+        }
+        std::sort(needed.begin(), needed.end());
+        needed.erase(std::unique(needed.begin(), needed.end()), needed.end());
+        if (!needed.empty()) {
+            PredGraph pg;
+            build_pred_graph(pg, w.predictor, resolve_decode_threads(n_threads));
+            if (!pg.ready) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
+
+            std::vector<PredictorSnapshot> snapshots(needed.size());
+            {
+                const int          n_layers = static_cast<int>(w.predictor.lstm.size());
+                const int          H        = w.predictor.pred_hidden;
+                LstmState          next_state;
+                std::vector<float> scratch_x;
+                next_state.reset(n_layers, H);
+                for (size_t k = 0; k < needed.size(); ++k) {
+                    const auto cp    = std::upper_bound(capture.checkpoints.begin(), capture.checkpoints.end(),
+                                                        needed[k],
+                                                        [](int t, const PredictorCheckpoint & c) { return t < c.token; }) -
+                                   1;
+                    LstmState  state = cp->state;
+                    int        last  = cp->last_token;
+                    for (int i = cp->token; i < needed[k]; ++i) {
+                        if (predictor_step_ggml(w.predictor, pg, last, state, next_state, scratch_x) == nullptr) {
+                            return TRANSCRIBE_ERR_BACKEND;
+                        }
+                        std::swap(state, next_state);
+                        last = tokens[static_cast<size_t>(i)].id;
+                    }
+                    snapshots[k].state      = std::move(state);
+                    snapshots[k].last_token = last;
+                }
+            }
+            t_replayed = ggml_time_us();
+
+            const int64_t last_frame = enc_proj_first_frame + n_frames - 1;
+            for (const VocabularyCandidate & c : scored_candidates) {
+                const TdtToken & first = tokens[static_cast<size_t>(c.first)];
+                const TdtToken & lastk = tokens[static_cast<size_t>(c.end - 1)];
+                // Window: a few frames either side of the span, clipped to the
+                // neighbouring tokens' frames. When the next token falls inside the
+                // tail, both paths must end by emitting it there; otherwise by a
+                // blank at the window's last frame.
+                int64_t s = std::max<int64_t>(first.step_at_emit - k_vocab_window_lead, 0);
+                if (c.first > 0) {
+                    s = std::max<int64_t>(s, tokens[static_cast<size_t>(c.first - 1)].step_at_emit);
+                }
+                int     next_id = -1;
+                int64_t e       = lastk.step_at_emit + std::max(lastk.duration_frames, 1) + k_vocab_window_tail;
+                if (c.end < static_cast<int>(tokens.size())) {
+                    const TdtToken & nx = tokens[static_cast<size_t>(c.end)];
+                    if (nx.step_at_emit <= e) {
+                        e       = nx.step_at_emit;
+                        next_id = nx.id;
+                    }
+                }
+                e = std::min(e, last_frame);
+                if (s < enc_proj_first_frame || e < s || e - s + 1 > k_vocab_max_window_frames) {
+                    continue;
+                }
+                const int W = static_cast<int>(e - s + 1);
+
+                WindowJoint joint;
+                if (!build_window_joint(joint, w.joint, pg.backend, W)) {
+                    return TRANSCRIBE_ERR_BACKEND;
+                }
+                ggml_backend_tensor_set(
+                    joint.enc_in,
+                    enc_proj + static_cast<size_t>(s - enc_proj_first_frame) * static_cast<size_t>(w.joint.joint_h),
+                    0, static_cast<size_t>(W) * static_cast<size_t>(w.joint.joint_h) * sizeof(float));
+
+                const auto snap_at = std::lower_bound(needed.begin(), needed.end(), c.first);
+                if (snap_at == needed.end() || *snap_at != c.first) {
+                    continue;
+                }
+                const size_t         snap = static_cast<size_t>(snap_at - needed.begin());
+                std::vector<int32_t> heard;
+                for (int i = c.first; i < c.end; ++i) {
+                    heard.push_back(tokens[static_cast<size_t>(i)].id);
+                }
+                WindowScorer scorer{ w, pg, joint, {}, {}, 0 };
+                double       heard_lp = 0.0;
+                double       term_lp  = 0.0;
+                const auto & term     = bias.terms[static_cast<size_t>(c.term)];
+                const double boost    = static_cast<double>(bias.boost) * static_cast<double>(term.ids.size());
+                if (!scorer.score(snapshots[snap], heard, next_id, k_neg_inf, heard_lp) ||
+                    !scorer.score(snapshots[snap], term.ids, next_id, heard_lp - boost, term_lp)) {
+                    return TRANSCRIBE_ERR_BACKEND;
+                }
+                joint_columns += scorer.joint_columns;
+                ++scored;
+                const double gain = term_lp + boost - heard_lp;
+                std::string  span;
+                for (const VocabularyWord & word : words) {
+                    if (word.first >= c.first && word.first < c.end) {
+                        span += span.empty() ? word.text : " " + word.text;
+                    }
+                }
+                log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                        "parakeet vocabulary: \"%s\" for \"%s\" frames %lld-%lld heard %.2f term %.2f boost %.2f -> %s",
+                        term.text.c_str(), span.c_str(), static_cast<long long>(s), static_cast<long long>(e), heard_lp,
+                        term_lp, boost, gain >= 0.0 ? "replace" : "keep");
+                if (gain >= 0.0) {
+                    accepted.push_back({ c, gain });
+                }
+            }
+        }
+    }
+
+    // Best gain first; overlapping spans give way.
+    std::stable_sort(accepted.begin(), accepted.end(),
+                     [](const ScoredCandidate & a, const ScoredCandidate & b) { return a.gain > b.gain; });
+    std::vector<ScoredCandidate> chosen;
+    for (const ScoredCandidate & a : accepted) {
+        bool overlaps = false;
+        for (const ScoredCandidate & b : chosen) {
+            overlaps = overlaps || (a.c.first < b.c.end && b.c.first < a.c.end);
+        }
+        if (!overlaps) {
+            chosen.push_back(a);
+        }
+    }
+
+    std::vector<VocabularyCandidate> replacements = spellings;
+    for (const ScoredCandidate & ch : chosen) {
+        replacements.push_back(ch.c);
+    }
+    std::sort(replacements.begin(), replacements.end(),
+              [](const VocabularyCandidate & a, const VocabularyCandidate & b) { return a.first < b.first; });
+    splice_vocabulary_replacements(replacements, bias, tokens);
+
+    log_msg(TRANSCRIBE_LOG_LEVEL_INFO,
+            "parakeet vocabulary: %d candidates, %d scored, %d replaced, %lld joint columns, %.1f ms (replay %.1f ms)",
+            static_cast<int>(candidates.size()), scored, static_cast<int>(replacements.size()),
+            static_cast<long long>(joint_columns), (ggml_time_us() - t_start) / 1000.0,
+            (t_replayed - t_start) / 1000.0);
+    return TRANSCRIBE_OK;
+}
+
+
+// ---------------------------------------------------------------------------
+// RNN-T greedy decode with vocabulary-tree branching
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// One LSTM step for N hypotheses at once: PredGraph's graph with a batch
+// dimension, on PredGraph's backend (borrowed).
+struct BatchPredGraph {
+    ggml_context *             ctx   = nullptr;
+    ggml_backend_buffer_t      buf   = nullptr;
+    ggml_cgraph *              graph = nullptr;
+    ggml_tensor *              x     = nullptr;  // [H, N]
+    std::vector<ggml_tensor *> ph, pc, nh, nc;   // [H, N] per layer
+    ggml_tensor *              proj = nullptr;   // [joint_h, N] pred_w @ h + pred_b
+    int                        N    = 0;
+
+    BatchPredGraph() = default;
+
+    ~BatchPredGraph() {
+        if (buf != nullptr) {
+            safe_buffer_free(buf);
+        }
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+    }
+
+    BatchPredGraph(const BatchPredGraph &)             = delete;
+    BatchPredGraph & operator=(const BatchPredGraph &) = delete;
+};
+
+bool build_batch_pred_graph(BatchPredGraph &      g,
+                            const HostPredictor & p,
+                            const HostJoint &     j,
+                            ggml_backend_t        backend,
+                            int                   N) {
+    const int H = p.pred_hidden;
+    const int L = static_cast<int>(p.lstm.size());
+    g.N         = N;
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * static_cast<size_t>(48 * L + 16) + ggml_graph_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    g.ctx         = ggml_init(ip);
+    if (g.ctx == nullptr) {
+        return false;
+    }
+    g.x = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, H, N);
+    ggml_set_input(g.x);
+    g.ph.assign(static_cast<size_t>(L), nullptr);
+    g.pc.assign(static_cast<size_t>(L), nullptr);
+    g.nh.assign(static_cast<size_t>(L), nullptr);
+    g.nc.assign(static_cast<size_t>(L), nullptr);
+    for (int l = 0; l < L; ++l) {
+        g.ph[l] = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, H, N);
+        ggml_set_input(g.ph[l]);
+        g.pc[l] = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, H, N);
+        ggml_set_input(g.pc[l]);
+    }
+    ggml_tensor * in = g.x;
+    for (int l = 0; l < L; ++l) {
+        const auto &  lh = p.lstm[static_cast<size_t>(l)];
+        ggml_tensor * gates =
+            ggml_add(g.ctx, ggml_add(g.ctx, ggml_mul_mat(g.ctx, lh.g_Wx, in), ggml_mul_mat(g.ctx, lh.g_Wh, g.ph[l])),
+                     lh.g_b);  // [4H, N]
+        auto part = [&](int k) {
+            return ggml_cont(g.ctx, ggml_view_2d(g.ctx, gates, H, N, gates->nb[1],
+                                                 static_cast<size_t>(k) * static_cast<size_t>(H) *
+                                                     ggml_element_size(gates)));
+        };
+        ggml_tensor * i_ = ggml_sigmoid(g.ctx, part(0));
+        ggml_tensor * f_ = ggml_sigmoid(g.ctx, part(1));
+        ggml_tensor * gg = ggml_tanh(g.ctx, part(2));
+        ggml_tensor * o_ = ggml_sigmoid(g.ctx, part(3));
+        g.nc[l]          = ggml_add(g.ctx, ggml_mul(g.ctx, f_, g.pc[l]), ggml_mul(g.ctx, i_, gg));
+        ggml_set_output(g.nc[l]);
+        g.nh[l] = ggml_mul(g.ctx, o_, ggml_tanh(g.ctx, g.nc[l]));
+        ggml_set_output(g.nh[l]);
+        in = g.nh[l];
+    }
+    g.proj = ggml_add(g.ctx, ggml_mul_mat(g.ctx, j.g_pred_w, in), j.g_pred_b);
+    ggml_set_output(g.proj);
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, backend);
+    if (g.buf == nullptr) {
+        return false;
+    }
+    g.graph = ggml_new_graph(g.ctx);
+    for (int l = 0; l < L; ++l) {
+        ggml_build_forward_expand(g.graph, g.nh[l]);
+        ggml_build_forward_expand(g.graph, g.nc[l]);
+    }
+    ggml_build_forward_expand(g.graph, g.proj);
+    return true;
+}
+
+// The joint for N hypotheses at one encoder frame, from each one's
+// projected predictor output (computed once, with its predictor step):
+// logits[joint_n, N] = out_w @ act(enc_proj + proj[:, n]) + out_b.
+struct BatchJoint {
+    ggml_context *        ctx     = nullptr;
+    ggml_backend_buffer_t buf     = nullptr;
+    ggml_cgraph *         graph   = nullptr;
+    ggml_tensor *         proj_in = nullptr;  // [joint_h, N]
+    ggml_tensor *         enc_in  = nullptr;  // [joint_h]
+    ggml_tensor *         logits  = nullptr;  // [joint_n, N]
+    int                   N       = 0;
+
+    BatchJoint() = default;
+
+    ~BatchJoint() {
+        if (buf != nullptr) {
+            safe_buffer_free(buf);
+        }
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+    }
+
+    BatchJoint(const BatchJoint &)             = delete;
+    BatchJoint & operator=(const BatchJoint &) = delete;
+};
+
+bool build_batch_joint(BatchJoint & g, const HostJoint & j, ggml_backend_t backend, int N) {
+    g.N = N;
+    ggml_init_params ip{};
+    ip.mem_size   = ggml_tensor_overhead() * 16 + ggml_graph_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    g.ctx         = ggml_init(ip);
+    if (g.ctx == nullptr) {
+        return false;
+    }
+    g.proj_in = ggml_new_tensor_2d(g.ctx, GGML_TYPE_F32, j.joint_h, N);
+    ggml_set_input(g.proj_in);
+    g.enc_in = ggml_new_tensor_1d(g.ctx, GGML_TYPE_F32, j.joint_h);
+    ggml_set_input(g.enc_in);
+    ggml_tensor * summed = ggml_add(g.ctx, g.proj_in, g.enc_in);
+    ggml_tensor * activated;
+    if (j.activation == "relu") {
+        activated = ggml_relu(g.ctx, summed);
+    } else if (j.activation == "sigmoid") {
+        activated = ggml_sigmoid(g.ctx, summed);
+    } else {
+        activated = ggml_tanh(g.ctx, summed);
+    }
+    g.logits = ggml_add(g.ctx, ggml_mul_mat(g.ctx, j.gw_w, activated), j.gw_b);
+    ggml_set_output(g.logits);
+    g.buf = ggml_backend_alloc_ctx_tensors(g.ctx, backend);
+    if (g.buf == nullptr) {
+        return false;
+    }
+    g.graph = ggml_new_graph(g.ctx);
+    ggml_build_forward_expand(g.graph, g.logits);
+    return true;
+}
+
+// One emitted token of some hypothesis. Hypotheses share their prefixes
+// through `parent`. A node at token index i % k_checkpoint_every == 0
+// holds the predictor as it stood before that token, for rescoring; the
+// nodes no surviving hypothesis reaches drop theirs (see gc below).
+struct BeamNode {
+    int                                  parent = -1;
+    int                                  id     = 0;
+    float                                p      = 0.0f;
+    int                                  step   = 0;
+    std::unique_ptr<PredictorCheckpoint> checkpoint;
+};
+
+struct BeamHyp {
+    double     score = 0.0;  // log P(tokens, alignment so far)
+    uint64_t   key        = 0;  // hash of the token sequence
+    int        tail       = -1;
+    int        len        = 0;
+    int        last_token = -1;
+    LstmState  prev;   // the predictor before consuming last_token
+    LstmState  state;  // and after; state.h.back() is the decoder output
+    std::shared_ptr<const std::vector<float>> proj;  // pred_w @ state.h.back() + pred_b
+};
+
+// A predictor step's result, kept by token-sequence key: in a long pause the
+// same expansion is proposed frame after frame, and the LSTM is the costliest
+// part of a step.
+struct PredResult {
+    LstmState                                 state;
+    std::shared_ptr<const std::vector<float>> proj;
+};
+
+uint64_t extend_key(uint64_t key, int token) {
+    uint64_t z = key + 0x9e3779b97f4a7c15ULL * static_cast<uint64_t>(token + 2);
+    z          = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z          = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+}  // namespace
+
+namespace {
+
+struct TreeShadow {
+    double   raw_score             = 0.0;
+    double   vit_score             = 0.0;
+    uint64_t key                   = 0;
+    int      tail                  = -1;
+    int      len                   = 0;
+    int      last_token            = -1;
+    int      origin_len            = 0;
+    int      origin_frame          = 0;
+    int      node                  = 0;
+    int      depth                 = 0;
+    int      wait_left             = 0;
+    int      completed_term        = -1;
+    int      completed_pieces      = 0;
+    int      completed_frame       = 0;
+    int      post_tokens           = 0;
+    int      post_words            = 0;
+    int      first_post_word_frame = -1;
+    bool     post_apostrophe       = false;
+    LstmState                                 prev;
+    LstmState                                 state;
+    std::shared_ptr<const std::vector<float>> proj;
+};
+
+struct TreeExpansion {
+    int    parent                = -1;
+    int    token                 = 0;
+    double raw_score             = 0.0;
+    double vit_score             = 0.0;
+    int    origin_len            = 0;
+    int    origin_frame          = 0;
+    int    node                  = 0;
+    int    depth                 = 0;
+    int    completed_term        = -1;
+    int    completed_pieces      = 0;
+    int    completed_frame       = 0;
+    int    post_tokens           = 0;
+    int    post_words            = 0;
+    int    first_post_word_frame = -1;
+    bool   post_apostrophe       = false;
+    uint64_t         g_key        = 0;
+    int              g_tail       = -1;
+    int              g_len        = 0;
+    int              g_last_token = -1;
+    LstmState        g_prev;
+    LstmState        g_state;
+    float            tok_p        = 0.0f;
+    int              target_step  = 1;
+};
+
+void merge_shadow(std::vector<TreeShadow> & set, TreeShadow && h) {
+    for (TreeShadow & b : set) {
+        if (b.key == h.key && b.len == h.len && b.origin_len == h.origin_len && b.node == h.node &&
+            b.completed_term == h.completed_term) {
+            const double merged = log_add(b.raw_score, h.raw_score);
+            const double vit    = std::max(b.vit_score, h.vit_score);
+            if (h.vit_score > b.vit_score) {
+                b = std::move(h);
+            }
+            b.raw_score = merged;
+            b.vit_score = vit;
+            return;
+        }
+    }
+    set.push_back(std::move(h));
+}
+
+}  // namespace
+
+transcribe_status decode_rnnt_tree(const HostDecoderWeights &    w,
+                                   const transcribe::Tokenizer & tok,
+                                   const float *                 enc_out,
+                                   int                           T_enc,
+                                   int                           d_enc,
+                                   int                           n_threads,
+                                   const TreeOptions &           options,
+                                   const VocabularyBias &        bias,
+                                   std::vector<TdtToken> &       out_tokens,
+                                   DecodeCapture *               capture) {
+    if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (d_enc != w.joint.d_enc || w.head_kind != HostHeadKind::RNNT) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (!bias.active() || bias.tree.empty()) {
+        return decode_rnnt_greedy(w, enc_out, T_enc, d_enc, n_threads, out_tokens, capture);
+    }
+
+    const VocabularyTree & tree          = bias.tree;
+    const int              nt            = resolve_decode_threads(n_threads);
+    const int              n_layers      = static_cast<int>(w.predictor.lstm.size());
+    const int              H             = w.predictor.pred_hidden;
+    const int              n_token_cls   = w.predictor.pred_vocab;
+    const int              joint_n       = w.joint.joint_n;
+    const int              joint_h       = w.joint.joint_h;
+    const int              blank_id      = w.blank_id;
+    const int              max_sym       = w.tdt_max_symbols > 0 ? w.tdt_max_symbols : 10;
+    constexpr int          k_max_shadows = 8;
+    constexpr double       k_prune_slack = 4.5;
+    constexpr int          k_max_age     = 28;
+    const double           tree_boost    = static_cast<double>(options.boost);
+    const double           skel_boost =
+        options.skeleton_boost > 0.0f ? static_cast<double>(options.skeleton_boost) : tree_boost;
+    const double B_max          = std::max(tree_boost, skel_boost);
+    const double max_tree_bonus = static_cast<double>(tree.nodes[0].max_rem) * B_max;
+
+    int apostrophe_id = -1;
+    for (int id = 0; id < tok.n_tokens(); ++id) {
+        if (tok.decode(&id, 1) == "'") {
+            apostrophe_id = id;
+            break;
+        }
+    }
+
+    PredGraph pg;
+    build_pred_graph(pg, w.predictor, nt);
+    if (!pg.ready) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (tree): ggml decode graph build failed");
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    std::vector<std::unique_ptr<BatchPredGraph>> preds(k_max_shadows + 2);
+    std::vector<std::unique_ptr<BatchJoint>>     joints(k_max_shadows + 2);
+
+    const int64_t      t_start = ggml_time_us();
+    std::vector<float> enc_proj_all;
+    if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc, d_enc, enc_proj_all)) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (tree): enc_proj graph failed");
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+
+    const size_t       hb = static_cast<size_t>(H) * sizeof(float);
+    std::vector<float> x_host;
+    int64_t            t_pred_us = 0, t_joint_us = 0;
+    int                n_pred = 0, n_joint = 0, n_cached = 0, n_replaced = 0;
+
+    auto predict = [&](const std::vector<int> & tokens, const std::vector<const LstmState *> & prev,
+                       std::vector<PredResult> & out) -> bool {
+        const int n = static_cast<int>(tokens.size());
+        if (static_cast<size_t>(n) >= preds.size()) {
+            preds.resize(static_cast<size_t>(n) + 1);
+        }
+        auto & gp = preds[static_cast<size_t>(n)];
+        if (gp == nullptr) {
+            gp = std::make_unique<BatchPredGraph>();
+            if (!build_batch_pred_graph(*gp, w.predictor, w.joint, pg.backend, n)) {
+                return false;
+            }
+        }
+        const int64_t t0 = ggml_time_us();
+        x_host.assign(static_cast<size_t>(n) * static_cast<size_t>(H), 0.0f);
+        for (int k = 0; k < n; ++k) {
+            if (tokens[static_cast<size_t>(k)] >= 0) {
+                std::memcpy(x_host.data() + static_cast<size_t>(k) * static_cast<size_t>(H),
+                            w.predictor.embed_w.data() +
+                                static_cast<size_t>(tokens[static_cast<size_t>(k)]) * static_cast<size_t>(H),
+                            hb);
+            }
+        }
+        ggml_backend_tensor_set(gp->x, x_host.data(), 0, hb * static_cast<size_t>(n));
+        for (int k = 0; k < n; ++k) {
+            for (int l = 0; l < n_layers; ++l) {
+                ggml_backend_tensor_set(gp->ph[l], prev[static_cast<size_t>(k)]->h[static_cast<size_t>(l)].data(),
+                                        hb * static_cast<size_t>(k), hb);
+                ggml_backend_tensor_set(gp->pc[l], prev[static_cast<size_t>(k)]->c[static_cast<size_t>(l)].data(),
+                                        hb * static_cast<size_t>(k), hb);
+            }
+        }
+        if (ggml_backend_graph_compute(pg.backend, gp->graph) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        out.resize(static_cast<size_t>(n));
+        const size_t jb = static_cast<size_t>(joint_h) * sizeof(float);
+        for (int k = 0; k < n; ++k) {
+            PredResult & r = out[static_cast<size_t>(k)];
+            r.state.reset(n_layers, H);
+            for (int l = 0; l < n_layers; ++l) {
+                ggml_backend_tensor_get(gp->nh[l], r.state.h[static_cast<size_t>(l)].data(),
+                                        hb * static_cast<size_t>(k), hb);
+                ggml_backend_tensor_get(gp->nc[l], r.state.c[static_cast<size_t>(l)].data(),
+                                        hb * static_cast<size_t>(k), hb);
+            }
+            auto proj = std::make_shared<std::vector<float>>(static_cast<size_t>(joint_h));
+            ggml_backend_tensor_get(gp->proj, proj->data(), jb * static_cast<size_t>(k), jb);
+            r.proj = std::move(proj);
+        }
+        t_pred_us += ggml_time_us() - t0;
+        ++n_pred;
+        return true;
+    };
+
+    std::vector<float> logits;
+    auto               joint_projs = [&](const std::vector<const float *> & projs, int t) -> bool {
+        const int n = static_cast<int>(projs.size());
+        if (static_cast<size_t>(n) >= joints.size()) {
+            joints.resize(static_cast<size_t>(n) + 1);
+        }
+        auto & gj = joints[static_cast<size_t>(n)];
+        if (gj == nullptr) {
+            gj = std::make_unique<BatchJoint>();
+            if (!build_batch_joint(*gj, w.joint, pg.backend, n)) {
+                return false;
+            }
+        }
+        const int64_t t0 = ggml_time_us();
+        const size_t  pb = static_cast<size_t>(joint_h) * sizeof(float);
+        for (int k = 0; k < n; ++k) {
+            ggml_backend_tensor_set(gj->proj_in, projs[static_cast<size_t>(k)], pb * static_cast<size_t>(k), pb);
+        }
+        ggml_backend_tensor_set(gj->enc_in, enc_proj_all.data() + static_cast<size_t>(t) * static_cast<size_t>(joint_h),
+                                0, pb);
+        if (ggml_backend_graph_compute(pg.backend, gj->graph) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        logits.resize(static_cast<size_t>(joint_n) * static_cast<size_t>(n));
+        ggml_backend_tensor_get(gj->logits, logits.data(), 0, logits.size() * sizeof(float));
+        t_joint_us += ggml_time_us() - t0;
+        ++n_joint;
+        return true;
+    };
+
+    auto max_bonus_of = [&](const TreeShadow & s) -> double {
+        if (s.completed_term >= 0) {
+            return static_cast<double>(s.completed_pieces) * B_max;
+        }
+        if (s.node > 0) {
+            return static_cast<double>(s.depth + tree.nodes[static_cast<size_t>(s.node)].max_rem) * B_max;
+        }
+        return max_tree_bonus;
+    };
+
+    std::vector<BeamNode> nodes;
+    BeamHyp               G;
+    {
+        G.prev.reset(n_layers, H);
+        std::vector<PredResult> out;
+        if (!predict({ -1 }, { &G.prev }, out)) {
+            return TRANSCRIBE_ERR_BACKEND;
+        }
+        G.state = std::move(out[0].state);
+        G.proj  = std::move(out[0].proj);
+    }
+
+    const auto & root_children = tree.nodes[0].children;
+
+    std::vector<TreeShadow>                  shadows;
+    std::vector<std::vector<TreeShadow>>     step_shadows(static_cast<size_t>(max_sym) + 1);
+    std::vector<TreeExpansion>               root_reqs;
+    std::vector<TreeExpansion>               expansions;
+    std::vector<const float *>               proj_ptrs;
+    std::vector<float>                       scratch_probs;
+    std::vector<uint8_t>                     reached;
+    std::vector<PredResult>                  new_states;
+    std::unordered_map<uint64_t, PredResult> pred_cache;
+    constexpr size_t                         k_pred_cache_max = 512;
+    const int                                k_cp             = DecodeCapture::k_checkpoint_every;
+
+    int g_last_emit_frame       = -10;
+    int g_last_word_start_frame = -10;
+
+    auto materialize_expansions = [&](std::vector<TreeExpansion> &          exps,
+                                      const std::vector<TreeShadow> *       parents,
+                                      std::vector<std::vector<TreeShadow>> & dst_steps,
+                                      int                                   fixed_step) -> bool {
+        if (exps.empty()) {
+            return true;
+        }
+        std::vector<int>               tokens;
+        std::vector<const LstmState *> prev;
+        std::vector<uint64_t>          keys;
+        std::vector<int>               batch_of(exps.size(), -1);
+        if (pred_cache.size() + exps.size() > k_pred_cache_max) {
+            pred_cache.clear();
+        }
+        for (size_t k = 0; k < exps.size(); ++k) {
+            const TreeExpansion & e    = exps[k];
+            const uint64_t        pkey = e.parent >= 0 ? (*parents)[static_cast<size_t>(e.parent)].key : e.g_key;
+            const uint64_t        key  = extend_key(pkey, e.token);
+            keys.push_back(key);
+            if (pred_cache.count(key) != 0) {
+                ++n_cached;
+                continue;
+            }
+            batch_of[k] = static_cast<int>(tokens.size());
+            tokens.push_back(e.token);
+            prev.push_back(e.parent >= 0 ? &(*parents)[static_cast<size_t>(e.parent)].state : &e.g_state);
+        }
+        if (!tokens.empty() && !predict(tokens, prev, new_states)) {
+            return false;
+        }
+        for (size_t k = 0; k < exps.size(); ++k) {
+            if (batch_of[k] >= 0) {
+                pred_cache[keys[k]] = new_states[static_cast<size_t>(batch_of[k])];
+            }
+        }
+        for (size_t k = 0; k < exps.size(); ++k) {
+            const TreeExpansion & e          = exps[k];
+            const int             p_tail     = e.parent >= 0 ? (*parents)[static_cast<size_t>(e.parent)].tail : e.g_tail;
+            const int             p_len      = e.parent >= 0 ? (*parents)[static_cast<size_t>(e.parent)].len : e.g_len;
+            const int             p_last_tok = e.parent >= 0 ? (*parents)[static_cast<size_t>(e.parent)].last_token : e.g_last_token;
+            const LstmState &     p_prev     = e.parent >= 0 ? (*parents)[static_cast<size_t>(e.parent)].prev : e.g_prev;
+            const LstmState &     p_state    = e.parent >= 0 ? (*parents)[static_cast<size_t>(e.parent)].state : e.g_state;
+            BeamNode              node;
+            node.parent = p_tail;
+            node.id     = e.token;
+            node.p      = e.tok_p;
+            node.step   = 0;
+            if (capture != nullptr && p_len % k_cp == 0) {
+                node.checkpoint =
+                    std::make_unique<PredictorCheckpoint>(PredictorCheckpoint{ p_len, p_last_tok, p_prev });
+            }
+            nodes.push_back(std::move(node));
+
+            const PredResult & r = pred_cache.count(keys[k]) != 0 ? pred_cache.at(keys[k]) :
+                                                                    new_states[static_cast<size_t>(batch_of[k])];
+            TreeShadow         h;
+            h.raw_score             = e.raw_score;
+            h.vit_score             = e.vit_score;
+            h.key                   = keys[k];
+            h.tail                  = static_cast<int>(nodes.size()) - 1;
+            h.len                   = p_len + 1;
+            h.last_token            = e.token;
+            h.origin_len            = e.origin_len;
+            h.origin_frame          = e.origin_frame;
+            h.node                  = e.node;
+            h.depth                 = e.depth;
+            h.completed_term        = e.completed_term;
+            h.completed_pieces      = e.completed_pieces;
+            h.completed_frame       = e.completed_frame;
+            h.post_tokens           = e.post_tokens;
+            h.post_words            = e.post_words;
+            h.first_post_word_frame = e.first_post_word_frame;
+            h.post_apostrophe       = e.post_apostrophe;
+            h.prev                  = p_state;
+            h.state                 = r.state;
+            h.proj                  = r.proj;
+            const int step_idx      = fixed_step >= 0 ? fixed_step : e.target_step;
+            merge_shadow(dst_steps[static_cast<size_t>(step_idx)], std::move(h));
+        }
+        return true;
+    };
+
+    for (int t = 0; t < T_enc; ++t) {
+        for (auto & ss : step_shadows) {
+            ss.clear();
+        }
+        step_shadows[0].swap(shadows);
+        shadows.clear();
+        root_reqs.clear();
+
+        // 1. Advance greedy backbone G across frame t.
+        for (int gs = 0; gs <= max_sym; ++gs) {
+            proj_ptrs = { G.proj->data() };
+            if (!joint_projs(proj_ptrs, t)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
+            const float * col        = logits.data();
+            const int     pred_token = argmax_range(col, n_token_cls);
+            const double  lse        = log_sum_exp(col, n_token_cls);
+            const float   best_logit = col[pred_token];
+
+            const auto pred_kind = (pred_token >= 0 && pred_token < static_cast<int>(tree.piece_kind.size())) ?
+                                       tree.piece_kind[static_cast<size_t>(pred_token)] :
+                                       VocabularyTree::k_other;
+            const bool mid_word  = (pred_token != blank_id && pred_kind == VocabularyTree::k_word_continue);
+
+            if (gs < max_sym && !mid_word) {
+                const float gate     = (pred_token == blank_id) ? 5.5f : 8.0f;
+                float       p_cached = -1.0f;
+                for (const auto & rc : root_children) {
+                    const int32_t rid   = rc.first;
+                    const int     rnode = rc.second;
+                    if (rid == blank_id || rid >= n_token_cls || col[rid] < best_logit - gate) {
+                        continue;
+                    }
+                    const double lp = static_cast<double>(col[rid]) - lse;
+                    if (lp < (pred_token == blank_id ? -5.5 : -8.0)) {
+                        continue;
+                    }
+                    const int    rem       = tree.nodes[static_cast<size_t>(rnode)].max_rem;
+                    const double max_bonus = static_cast<double>(1 + rem) * B_max;
+                    if (lp + max_bonus < -k_prune_slack) {
+                        continue;
+                    }
+                    if (p_cached < 0.0f) {
+                        p_cached = token_confidence(col, n_token_cls, scratch_probs);
+                    }
+                    auto make_req = [&](bool end_now) {
+                        TreeExpansion req;
+                        req.parent           = -1;
+                        req.token            = rid;
+                        req.raw_score        = G.score + lp;
+                        req.vit_score        = G.score + lp;
+                        req.origin_len       = G.len;
+                        req.origin_frame     = t;
+                        req.node             = end_now ? 0 : rnode;
+                        req.depth            = end_now ? 0 : 1;
+                        req.completed_term   = end_now ? tree.nodes[static_cast<size_t>(rnode)].term : -1;
+                        req.completed_pieces = end_now ? 1 : 0;
+                        req.completed_frame  = t;
+                        req.g_key            = G.key;
+                        req.g_tail           = G.tail;
+                        req.g_len            = G.len;
+                        req.g_last_token     = G.last_token;
+                        req.g_prev           = G.prev;
+                        req.g_state          = G.state;
+                        req.tok_p            = p_cached;
+                        req.target_step      = gs + 1;
+                        root_reqs.push_back(std::move(req));
+                    };
+                    if (tree.nodes[static_cast<size_t>(rnode)].end) {
+                        make_req(true);
+                    }
+                    if (!tree.nodes[static_cast<size_t>(rnode)].children.empty()) {
+                        make_req(false);
+                    }
+                }
+                if (pred_token != blank_id && pred_kind == VocabularyTree::k_word_start) {
+                    const double lp_b = static_cast<double>(col[blank_id]) - lse;
+                    if (lp_b >= -5.0) {
+                        TreeShadow waiter;
+                        waiter.raw_score    = G.score + lp_b;
+                        waiter.vit_score    = G.score + lp_b;
+                        waiter.key          = G.key;
+                        waiter.tail         = G.tail;
+                        waiter.len          = G.len;
+                        waiter.last_token   = G.last_token;
+                        waiter.origin_len   = G.len;
+                        waiter.origin_frame = t;
+                        waiter.wait_left    = 2;
+                        waiter.prev         = G.prev;
+                        waiter.state        = G.state;
+                        waiter.proj         = G.proj;
+                        merge_shadow(shadows, std::move(waiter));
+                    }
+                }
+            }
+
+            if (pred_token == blank_id || gs == max_sym) {
+                G.score += static_cast<double>(col[blank_id]) - lse;
+                break;
+            }
+
+            G.score += static_cast<double>(col[pred_token]) - lse;
+            BeamNode node;
+            node.parent = G.tail;
+            node.id     = pred_token;
+            node.p      = token_confidence(col, n_token_cls, scratch_probs);
+            node.step   = t;
+            if (capture != nullptr && G.len % k_cp == 0) {
+                node.checkpoint =
+                    std::make_unique<PredictorCheckpoint>(PredictorCheckpoint{ G.len, G.last_token, G.prev });
+            }
+            nodes.push_back(std::move(node));
+
+            const uint64_t new_key = extend_key(G.key, pred_token);
+            if (pred_cache.size() + 1 > k_pred_cache_max) {
+                pred_cache.clear();
+            }
+            if (pred_cache.count(new_key) != 0) {
+                ++n_cached;
+            } else {
+                if (!predict({ pred_token }, { &G.state }, new_states)) {
+                    return TRANSCRIBE_ERR_BACKEND;
+                }
+                pred_cache[new_key] = std::move(new_states[0]);
+            }
+            const PredResult & r = pred_cache.at(new_key);
+            G.key                = new_key;
+            G.tail               = static_cast<int>(nodes.size()) - 1;
+            G.len               += 1;
+            G.last_token         = pred_token;
+            G.prev               = std::move(G.state);
+            G.state              = r.state;
+            G.proj               = r.proj;
+            g_last_emit_frame    = t;
+            if (pred_token >= 0 && pred_token < static_cast<int>(tree.piece_kind.size()) &&
+                tree.piece_kind[static_cast<size_t>(pred_token)] == VocabularyTree::k_word_start) {
+                g_last_word_start_frame = t;
+            }
+        }
+
+        // Materialize root spawns from G into step_shadows[gs + 1].
+        if (!root_reqs.empty()) {
+            root_reqs.erase(std::remove_if(root_reqs.begin(), root_reqs.end(),
+                                           [&](const TreeExpansion & e) {
+                                               const double mb =
+                                                   e.completed_term >= 0 ?
+                                                       static_cast<double>(e.completed_pieces) * B_max :
+                                                       static_cast<double>(
+                                                           e.depth +
+                                                           tree.nodes[static_cast<size_t>(e.node)].max_rem) *
+                                                           B_max;
+                                               return e.raw_score + mb < G.score - k_prune_slack;
+                                           }),
+                            root_reqs.end());
+            if (static_cast<int>(root_reqs.size()) > 4) {
+                std::sort(root_reqs.begin(), root_reqs.end(),
+                          [](const TreeExpansion & a, const TreeExpansion & b) { return a.raw_score > b.raw_score; });
+                root_reqs.resize(4);
+            }
+            const size_t n_before = nodes.size();
+            if (!materialize_expansions(root_reqs, nullptr, step_shadows, -1)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
+            for (size_t ni = n_before; ni < nodes.size(); ++ni) {
+                nodes[ni].step = t;
+            }
+        }
+
+        // 2. Advance active trie shadows across frame t.
+        for (int s = 0; s <= max_sym; ++s) {
+            auto & cur = step_shadows[static_cast<size_t>(s)];
+            cur.erase(std::remove_if(cur.begin(), cur.end(),
+                                     [&](const TreeShadow & h) {
+                                         return t - h.origin_frame > k_max_age ||
+                                                h.raw_score + max_bonus_of(h) < G.score - k_prune_slack;
+                                     }),
+                      cur.end());
+            if (cur.empty()) {
+                continue;
+            }
+            if (static_cast<int>(cur.size()) > k_max_shadows) {
+                std::sort(cur.begin(), cur.end(), [&](const TreeShadow & a, const TreeShadow & b) {
+                    return a.raw_score + max_bonus_of(a) > b.raw_score + max_bonus_of(b);
+                });
+                cur.resize(k_max_shadows);
+            }
+
+            proj_ptrs.resize(cur.size());
+            for (size_t i = 0; i < cur.size(); ++i) {
+                proj_ptrs[i] = cur[i].proj->data();
+            }
+            if (!joint_projs(proj_ptrs, t)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
+
+            expansions.clear();
+            for (size_t i = 0; i < cur.size(); ++i) {
+                const float *      col = logits.data() + i * static_cast<size_t>(joint_n);
+                const double       lse = log_sum_exp(col, n_token_cls);
+                const TreeShadow & a   = cur[i];
+
+                // Blank transition to next frame.
+                {
+                    const double lp_b     = static_cast<double>(col[blank_id]) - lse;
+                    const double next_raw = a.raw_score + lp_b;
+                    const double next_vit = a.vit_score + lp_b;
+                    if (a.node == 0 && a.completed_term < 0) {
+                        if (a.wait_left > 1 && next_raw >= G.score - 5.0) {
+                            TreeShadow b = a;
+                            b.raw_score  = next_raw;
+                            b.vit_score  = next_vit;
+                            b.wait_left  = a.wait_left - 1;
+                            merge_shadow(shadows, std::move(b));
+                        }
+                    } else if (next_raw + max_bonus_of(a) >= G.score - k_prune_slack) {
+                        TreeShadow b = a;
+                        b.raw_score  = next_raw;
+                        b.vit_score  = next_vit;
+                        merge_shadow(shadows, std::move(b));
+                    }
+                }
+                if (s == max_sym) {
+                    continue;
+                }
+
+                float p_cached = -1.0f;
+                auto  conf     = [&]() {
+                    if (p_cached < 0.0f) {
+                        p_cached = token_confidence(col, n_token_cls, scratch_probs);
+                    }
+                    return p_cached;
+                };
+
+                if (a.node == 0 && a.completed_term < 0) {
+                    for (const auto & rc : root_children) {
+                        const int32_t rid   = rc.first;
+                        const int     rnode = rc.second;
+                        if (rid == blank_id || rid >= n_token_cls) {
+                            continue;
+                        }
+                        const double lp = static_cast<double>(col[rid]) - lse;
+                        if (lp < -8.0) {
+                            continue;
+                        }
+                        const int    rem = tree.nodes[static_cast<size_t>(rnode)].max_rem;
+                        const double mb  = static_cast<double>(1 + rem) * B_max;
+                        if (a.raw_score + lp + mb < G.score - k_prune_slack) {
+                            continue;
+                        }
+                        auto add_root = [&](bool end_now) {
+                            TreeExpansion e;
+                            e.parent           = static_cast<int>(i);
+                            e.token            = rid;
+                            e.raw_score        = a.raw_score + lp;
+                            e.vit_score        = a.vit_score + lp;
+                            e.origin_len       = a.origin_len;
+                            e.origin_frame     = a.origin_frame;
+                            e.node             = end_now ? 0 : rnode;
+                            e.depth            = end_now ? 0 : 1;
+                            e.completed_term   = end_now ? tree.nodes[static_cast<size_t>(rnode)].term : -1;
+                            e.completed_pieces = end_now ? 1 : 0;
+                            e.completed_frame  = t;
+                            e.tok_p            = conf();
+                            expansions.push_back(std::move(e));
+                        };
+                        if (tree.nodes[static_cast<size_t>(rnode)].end) {
+                            add_root(true);
+                        }
+                        if (!tree.nodes[static_cast<size_t>(rnode)].children.empty()) {
+                            add_root(false);
+                        }
+                    }
+                } else if (a.node > 0) {
+                    for (const auto & [cid, next_node] : tree.nodes[static_cast<size_t>(a.node)].children) {
+                        if (cid == blank_id || cid >= n_token_cls) {
+                            continue;
+                        }
+                        const double lp         = static_cast<double>(col[cid]) - lse;
+                        const int    next_depth = a.depth + 1;
+                        const auto & nn         = tree.nodes[static_cast<size_t>(next_node)];
+                        if (nn.end) {
+                            const double mb = static_cast<double>(next_depth) * B_max;
+                            if (a.raw_score + lp + mb >= G.score - k_prune_slack) {
+                                TreeExpansion e;
+                                e.parent           = static_cast<int>(i);
+                                e.token            = cid;
+                                e.raw_score        = a.raw_score + lp;
+                                e.vit_score        = a.vit_score + lp;
+                                e.origin_len       = a.origin_len;
+                                e.origin_frame     = a.origin_frame;
+                                e.node             = 0;
+                                e.depth            = 0;
+                                e.completed_term   = nn.term;
+                                e.completed_pieces = next_depth;
+                                e.completed_frame  = t;
+                                e.tok_p            = conf();
+                                expansions.push_back(std::move(e));
+                            }
+                        }
+                        if (!nn.children.empty()) {
+                            const double mb = static_cast<double>(next_depth + nn.max_rem) * B_max;
+                            if (a.raw_score + lp + mb >= G.score - k_prune_slack) {
+                                TreeExpansion e;
+                                e.parent       = static_cast<int>(i);
+                                e.token        = cid;
+                                e.raw_score    = a.raw_score + lp;
+                                e.vit_score    = a.vit_score + lp;
+                                e.origin_len   = a.origin_len;
+                                e.origin_frame = a.origin_frame;
+                                e.node         = next_node;
+                                e.depth        = next_depth;
+                                e.tok_p        = conf();
+                                expansions.push_back(std::move(e));
+                            }
+                        }
+                    }
+                } else {
+                    const int gtok = argmax_range(col, n_token_cls);
+                    if (gtok != blank_id) {
+                        const auto kind = (gtok >= 0 && gtok < static_cast<int>(tree.piece_kind.size())) ?
+                                              tree.piece_kind[static_cast<size_t>(gtok)] :
+                                              VocabularyTree::k_other;
+                        if (!(a.post_tokens == 0 && kind == VocabularyTree::k_word_continue)) {
+                            const double lp = static_cast<double>(col[gtok]) - lse;
+                            const double mb = static_cast<double>(a.completed_pieces) * B_max;
+                            if (a.raw_score + lp + mb >= G.score - k_prune_slack) {
+                                TreeExpansion e;
+                                e.parent                = static_cast<int>(i);
+                                e.token                 = gtok;
+                                e.raw_score             = a.raw_score + lp;
+                                e.vit_score             = a.vit_score + lp;
+                                e.origin_len            = a.origin_len;
+                                e.origin_frame          = a.origin_frame;
+                                e.completed_term        = a.completed_term;
+                                e.completed_pieces      = a.completed_pieces;
+                                e.completed_frame       = a.completed_frame;
+                                e.post_tokens           = a.post_tokens + 1;
+                                e.post_words            = a.post_words + (kind == VocabularyTree::k_word_start ? 1 : 0);
+                                e.first_post_word_frame = (a.post_words == 0 && kind == VocabularyTree::k_word_start) ?
+                                                              t :
+                                                              a.first_post_word_frame;
+                                e.post_apostrophe       = a.post_apostrophe || (a.post_tokens == 0 && gtok == apostrophe_id);
+                                e.tok_p                 = conf();
+                                expansions.push_back(std::move(e));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (expansions.empty()) {
+                continue;
+            }
+            if (static_cast<int>(expansions.size()) > k_max_shadows) {
+                std::sort(expansions.begin(), expansions.end(), [&](const TreeExpansion & a, const TreeExpansion & b) {
+                    const double ma = a.completed_term >= 0 ?
+                                          static_cast<double>(a.completed_pieces) * B_max :
+                                          static_cast<double>(a.depth + tree.nodes[static_cast<size_t>(a.node)].max_rem) *
+                                              B_max;
+                    const double mb = b.completed_term >= 0 ?
+                                          static_cast<double>(b.completed_pieces) * B_max :
+                                          static_cast<double>(b.depth + tree.nodes[static_cast<size_t>(b.node)].max_rem) *
+                                              B_max;
+                    return a.raw_score + ma > b.raw_score + mb;
+                });
+                expansions.resize(k_max_shadows);
+            }
+            const size_t n_before = nodes.size();
+            if (!materialize_expansions(expansions, &cur, step_shadows, s + 1)) {
+                return TRANSCRIBE_ERR_BACKEND;
+            }
+            for (size_t ni = n_before; ni < nodes.size(); ++ni) {
+                nodes[ni].step = t;
+            }
+        }
+
+        // 3. Synchronize completed term shadows with greedy backbone G.
+        int    best_idx = -1;
+        double best_eff = G.score;
+        for (size_t i = 0; i < shadows.size(); ++i) {
+            const TreeShadow & s = shadows[i];
+            if (s.completed_term < 0) {
+                continue;
+            }
+            const bool synced =
+                (t == T_enc - 1) ||
+                (s.post_words >= 1 && s.last_token == G.last_token && g_last_word_start_frame > s.origin_frame) ||
+                (s.post_words == 0 && t - s.completed_frame >= 3 && t - g_last_emit_frame >= 2) ||
+                (t - s.completed_frame >= 6);
+            if (!synced) {
+                continue;
+            }
+
+            std::vector<TdtToken> g_since;
+            if (G.len > s.origin_len) {
+                g_since.resize(static_cast<size_t>(G.len - s.origin_len));
+                int cur_n = G.tail;
+                for (int k = G.len - 1; k >= s.origin_len && cur_n >= 0; --k) {
+                    const BeamNode & bn                            = nodes[static_cast<size_t>(cur_n)];
+                    g_since[static_cast<size_t>(k - s.origin_len)] = TdtToken{ bn.id, bn.p, bn.step, 1 };
+                    cur_n                                          = bn.parent;
+                }
+            }
+            if (!g_since.empty() && s.origin_len > 0) {
+                const int first_id = g_since.front().id;
+                if (first_id >= 0 && first_id < static_cast<int>(tree.piece_kind.size()) &&
+                    tree.piece_kind[static_cast<size_t>(first_id)] == VocabularyTree::k_word_continue) {
+                    continue;
+                }
+            }
+            std::vector<VocabularyWord> g_words = vocabulary_words(tok, g_since);
+            if (s.post_words > 0) {
+                int to_drop = s.post_words;
+                while (!g_words.empty() && to_drop > 0) {
+                    const int w_step = g_since[static_cast<size_t>(g_words.back().first)].step_at_emit;
+                    if (w_step >= s.first_post_word_frame - 1 && w_step > s.origin_frame) {
+                        g_words.pop_back();
+                        --to_drop;
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                while (!g_words.empty()) {
+                    const int w_step = g_since[static_cast<size_t>(g_words.back().first)].step_at_emit;
+                    if (w_step > s.completed_frame + 1 && w_step > s.origin_frame) {
+                        g_words.pop_back();
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            bool dropped_possessive = false;
+            if (!g_words.empty() && apostrophe_id >= 0 && !s.post_apostrophe) {
+                const VocabularyWord & lw = g_words.back();
+                for (int ti = lw.core_end; ti < lw.end; ++ti) {
+                    if (g_since[static_cast<size_t>(ti)].id == apostrophe_id) {
+                        dropped_possessive = true;
+                        break;
+                    }
+                }
+            }
+            if (dropped_possessive) {
+                continue;
+            }
+
+            const int cls = classify_vocabulary_span(g_words, bias, s.completed_term);
+            if (cls < 0) {
+                continue;
+            }
+            const double per_pc = (cls > 0) ? skel_boost : tree_boost;
+            const double base   = cls == 0 ? s.vit_score : s.raw_score;
+            const double eff    = base + static_cast<double>(s.completed_pieces) * per_pc;
+            if (eff > best_eff) {
+                best_eff = eff;
+                best_idx = static_cast<int>(i);
+            }
+        }
+
+        if (best_idx >= 0) {
+            TreeShadow & win = shadows[static_cast<size_t>(best_idx)];
+            log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+                    "parakeet tree: \"%s\" beat greedy at frame %d (score %.2f > %.2f)",
+                    bias.terms[static_cast<size_t>(win.completed_term)].text.c_str(), t, best_eff, G.score);
+            if (win.tail >= 0) {
+                g_last_emit_frame = std::max(g_last_emit_frame, nodes[static_cast<size_t>(win.tail)].step);
+            }
+            if (win.first_post_word_frame >= 0) {
+                g_last_word_start_frame = std::max(g_last_word_start_frame, win.first_post_word_frame);
+            } else {
+                g_last_word_start_frame = std::max(g_last_word_start_frame, win.origin_frame);
+            }
+            G.score      = win.vit_score;
+            G.key        = win.key;
+            G.tail       = win.tail;
+            G.len        = win.len;
+            G.last_token = win.last_token;
+            G.prev       = std::move(win.prev);
+            G.state      = std::move(win.state);
+            G.proj       = std::move(win.proj);
+            shadows.clear();
+            ++n_replaced;
+        } else {
+            shadows.erase(std::remove_if(shadows.begin(), shadows.end(),
+                                         [&](const TreeShadow & s) {
+                                             if (s.completed_term < 0) {
+                                                 return t - s.origin_frame > k_max_age ||
+                                                        s.raw_score + max_bonus_of(s) < G.score - k_prune_slack;
+                                             }
+                                             const bool synced =
+                                                 (t == T_enc - 1) ||
+                                                 (s.post_words >= 1 && s.last_token == G.last_token &&
+                                                  g_last_word_start_frame > s.origin_frame) ||
+                                                 (s.post_words == 0 && t - s.completed_frame >= 3 &&
+                                                  t - g_last_emit_frame >= 2) ||
+                                                 (t - s.completed_frame >= 6);
+                                             return synced || s.raw_score + max_bonus_of(s) < G.score - k_prune_slack;
+                                         }),
+                          shadows.end());
+            if (static_cast<int>(shadows.size()) > k_max_shadows) {
+                std::sort(shadows.begin(), shadows.end(), [&](const TreeShadow & a, const TreeShadow & b) {
+                    return a.raw_score + max_bonus_of(a) > b.raw_score + max_bonus_of(b);
+                });
+                shadows.resize(k_max_shadows);
+            }
+        }
+
+        if (capture != nullptr && (t % 64 == 63)) {
+            reached.assign(nodes.size(), 0);
+            for (int i = G.tail; i >= 0 && reached[static_cast<size_t>(i)] == 0; i = nodes[static_cast<size_t>(i)].parent) {
+                reached[static_cast<size_t>(i)] = 1;
+            }
+            for (const TreeShadow & h : shadows) {
+                for (int i = h.tail; i >= 0 && reached[static_cast<size_t>(i)] == 0;
+                     i     = nodes[static_cast<size_t>(i)].parent) {
+                    reached[static_cast<size_t>(i)] = 1;
+                }
+            }
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                if (reached[i] == 0) {
+                    nodes[i].checkpoint.reset();
+                }
+            }
+        }
+    }
+
+    std::vector<int> path;
+    for (int i = G.tail; i >= 0; i = nodes[static_cast<size_t>(i)].parent) {
+        path.push_back(i);
+    }
+    std::reverse(path.begin(), path.end());
+    const size_t first_out = out_tokens.size();
+    for (const int i : path) {
+        BeamNode & node = nodes[static_cast<size_t>(i)];
+        if (capture != nullptr && node.checkpoint != nullptr) {
+            PredictorCheckpoint cp = std::move(*node.checkpoint);
+            cp.token += static_cast<int>(first_out);
+            capture->checkpoints.push_back(std::move(cp));
+        }
+        TdtToken tok_out;
+        tok_out.id              = node.id;
+        tok_out.p               = node.p;
+        tok_out.step_at_emit    = node.step;
+        tok_out.duration_frames = 1;
+        out_tokens.push_back(tok_out);
+    }
+
+    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG,
+            "decoder (rnnt tree): %d tokens, T_enc=%d  %d joint (%.1f ms)  %d pred (%.1f ms)  %d cached  "
+            "%d replaced  %zu nodes  total=%.1f ms",
+            static_cast<int>(path.size()), T_enc, n_joint, t_joint_us / 1000.0, n_pred, t_pred_us / 1000.0, n_cached,
+            n_replaced, nodes.size(), (ggml_time_us() - t_start) / 1000.0);
+
+    if (capture != nullptr) {
+        capture->enc_proj             = std::move(enc_proj_all);
+        capture->enc_proj_first_frame = 0;
+    }
     return TRANSCRIBE_OK;
 }
 

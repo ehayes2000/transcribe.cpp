@@ -1,0 +1,201 @@
+// arch/parakeet/vocabulary.h - Custom vocabulary biasing for the
+// transducer heads (RNN-T and TDT).
+//
+// Parakeet takes transcribe_run_params::vocabulary (and the optional
+// transcribe_parakeet_vocabulary_ext) in one of two ways. Biasing the greedy
+// argmax toward a term's first piece either never fires (the margin gate
+// holds against a confident "a") or fires on ordinary speech, and a full
+// beam search drops whole phrases on this model; all were measured.
+//
+// An offline RNN-T decode runs decode_rnnt_tree (decoder.h): the greedy
+// path stands, and shadow hypotheses spell terms through VocabularyTree
+// alongside it, replacing a greedy span only when a whole term wins at the
+// word boundary (classify_vocabulary_span picks its boost).
+//
+// TDT heads and streams rescore after the greedy decode:
+//
+//   1. find_vocabulary_candidates picks word spans of the transcript whose
+//      letters or consonant skeleton are close to a term, or that equal one
+//      of its sounds-like spellings ("a bat war" for "Abattoir");
+//   2. rescore_vocabulary (decoder.cpp) scores the term and the span by the
+//      transducer's own forward algorithm over the same encoder frames, from
+//      the same predictor state;
+//   3. the term replaces the span when its log-probability plus `boost`
+//      per term piece is at least the span's.
+//
+// An exact sounds-like spelling is a declared mishearing, so it does not
+// need acoustic scores: force_vocabulary_spellings replaces those spans in
+// a pure token pass after decode_rnnt_tree, and rescore_vocabulary includes
+// the same replacements in its final splice. A spelling is still a sound
+// match to the tree, though: classify_vocabulary_span gives it the full
+// vocabulary boost, not the 0.6x tree ratio. Only the exact pass is
+// unconditional.
+//
+// The audio decides the fuzzy matches; the boost only says how much worse
+// than the heard words a term may score and still win. It is per piece
+// because the predictor's own language model charges a rare word for every
+// piece it spells ("▁A b att oir" against "▁avatar"). Bounded: at most k_vocab_max_terms
+// terms of at most k_vocab_max_term_tokens pieces, k_vocab_max_candidates
+// spans per decode, and windows of at most k_vocab_max_window_frames.
+
+#pragma once
+
+#include "decoder.h"
+#include "transcribe.h"
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace transcribe {
+class Tokenizer;
+}
+
+namespace transcribe::parakeet {
+
+constexpr int   k_vocab_max_terms         = 64;
+constexpr int   k_vocab_max_spellings     = 256;
+constexpr int   k_vocab_max_term_bytes    = 128;
+constexpr int   k_vocab_max_term_tokens   = 12;
+constexpr int   k_vocab_max_span_words    = 4;
+constexpr int   k_vocab_max_candidates    = 16;
+constexpr int   k_vocab_max_window_frames = 96;
+constexpr int   k_vocab_window_lead       = 4;  // frames before the span's first token
+constexpr int   k_vocab_window_tail       = 6;  // frames after its last
+// Shortest term (in letters) matched by sound alone; shorter terms are
+// matched only through their sounds-like spellings.
+constexpr int   k_vocab_min_fuzzy_letters = 5;
+constexpr float k_vocab_default_boost = 2.5f;  // nats per term piece; see Hex docs/research/vocabulary-boost-results.md
+
+struct VocabularyTerm {
+    std::string          text;
+    std::vector<int32_t> ids;       // SentencePiece pieces of " " + text
+    std::string          letters;   // vocabulary_letters(text)
+    std::string          skeleton;  // vocabulary_skeleton(letters)
+};
+
+struct VocabularySpelling {
+    std::string letters;
+    int         term = 0;
+};
+
+// The terms as a token trie for decode-time boosting (decode_rnnt_tree):
+// a shadow hypothesis walks the trie as it emits pieces, and `max_rem` is
+// the most pieces still to spell below a node.
+struct VocabularyTree {
+    enum PieceKind : uint8_t { k_other = 0, k_word_start = 1, k_word_continue = 2 };
+
+    struct Node {
+        std::vector<std::pair<int32_t, int>> children;  // (token id, node)
+        bool                                 end     = false;
+        int                                  term    = -1;
+        int                                  max_rem = 0;
+    };
+
+    std::vector<Node>    nodes;       // nodes[0] is the root
+    std::vector<uint8_t> piece_kind;  // per token id
+
+    void add(const std::vector<int32_t> & ids, int term = -1);
+    int  child(int node, int32_t token) const;
+    bool empty() const { return nodes.size() <= 1; }
+};
+
+struct VocabularyBias {
+    float                           boost = 0.0f;
+    std::vector<VocabularyTerm>     terms;
+    std::vector<VocabularySpelling> spellings;
+    VocabularyTree                  tree;
+
+    bool active() const { return boost > 0.0f && !terms.empty(); }
+};
+
+// Compile params->vocabulary (+ the PKVB extension, if any) against the
+// model's tokenizer. Terms that do not encode, encode to an unknown piece,
+// or exceed the bounds are skipped with a warning. An inactive result
+// (no terms, or boost 0) means no rescoring. Fails only on a malformed
+// extension.
+transcribe_status compile_vocabulary(const Tokenizer & tok, const transcribe_run_params * params, VocabularyBias & out);
+
+// One word of the transcript: raw token range and the range without its
+// trailing punctuation pieces. `text` is the core's decoded text.
+struct VocabularyWord {
+    int         first    = 0;
+    int         core_end = 0;
+    int         end      = 0;
+    std::string text;
+};
+
+std::vector<VocabularyWord> vocabulary_words(const Tokenizer & tok, const std::vector<TdtToken> & tokens);
+
+struct VocabularyCandidate {
+    int   first    = 0;      // raw token index of the span's first token
+    int   end      = 0;      // one past the span's last core token
+    int   term     = 0;
+    float rank     = 0;      // lower is closer; 0 for a sounds-like spelling
+    bool  spelling = false;  // letters equal one of the term's spellings
+};
+
+// Whether `letters` equals one of `term_index`'s sounds-like spellings.
+// A spelling must be at least two Unicode code points: one letter is too
+// little to tell a declared mishearing from an ordinary word.
+bool vocabulary_span_matches_spelling(const VocabularyBias & bias, int term_index, const std::string & letters);
+
+// Spans of `words` worth rescoring, closest first, at most
+// k_vocab_max_candidates. Exact spellings are candidates too: they sort
+// first because their rank is 0 and count toward that cap. Pure (no model
+// access).
+std::vector<VocabularyCandidate> find_vocabulary_candidates(const std::vector<VocabularyWord> & words,
+                                                            const VocabularyBias &              bias);
+
+// Exact sounds-like spelling candidates among `candidates`, resolved
+// deterministically: longest span first (token range), then earliest
+// position, with a later span that overlaps an already-chosen one dropped.
+// Logs each chosen replacement at DEBUG and returns them sorted by position.
+// Pure (no model access).
+std::vector<VocabularyCandidate> resolve_vocabulary_spellings(const std::vector<VocabularyCandidate> & candidates,
+                                                              const std::vector<VocabularyWord> &      words,
+                                                              const VocabularyBias &                   bias);
+
+// Splice each selected span into its term's pieces, spread over the span:
+// the minimum token confidence, emit frames interpolated from first to last,
+// and the last token's duration. `chosen` must be sorted by `first` and must
+// not overlap.
+void splice_vocabulary_replacements(const std::vector<VocabularyCandidate> & chosen,
+                                    const VocabularyBias &                   bias,
+                                    std::vector<TdtToken> &                  tokens);
+
+// Replace exact sounds-like spelling spans in `tokens` with their terms.
+// The pure core of force_vocabulary_spellings, taking already-segmented
+// words so it is testable without a tokenizer.
+void apply_vocabulary_spellings(const std::vector<VocabularyWord> & words,
+                                const VocabularyBias &              bias,
+                                std::vector<TdtToken> &             tokens);
+
+// Replace exact sounds-like spelling spans in `tokens` with their terms.
+// Pure token pass: no acoustic scores and no decode capture. Callers run it
+// after every vocabulary-active decode.
+void force_vocabulary_spellings(const Tokenizer & tok, const VocabularyBias & bias, std::vector<TdtToken> & tokens);
+
+// Classify a greedy word span covered by a decode-time vocabulary hypothesis:
+//  -1: keep greedy (already written, case-only, inflection, address/path, or
+//      swallows a neighbouring word around a closer inner span)
+//   0: non-skeleton match (dropped word or short near-miss; use tree boost)
+//   1: phonetic/skeleton or sounds-like match (use full vocabulary boost)
+int classify_vocabulary_span(const std::vector<VocabularyWord> & span_words,
+                             const VocabularyBias &              bias,
+                             int                                 term_index);
+
+// Lowercase ASCII letters and digits of `text`; other ASCII is dropped and
+// non-ASCII bytes are kept.
+std::string vocabulary_letters(const std::string & text);
+
+// A rough consonant skeleton of `letters` for sound-alike matching: an
+// initial vowel becomes '*', later vowels and h/w/y drop, voiced
+// consonants map to voiceless ones (b/v→p, d→t, g→k, z→s), c/q→k,
+// x→ks, ph→f, and repeats collapse. "abattoir", "a bat war" and
+// "avatar" all give "*ptr".
+std::string vocabulary_skeleton(const std::string & letters);
+
+int vocabulary_edit_distance(const std::string & a, const std::string & b);
+
+}  // namespace transcribe::parakeet
