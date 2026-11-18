@@ -1,0 +1,67 @@
+bindings/rust/sys/src/transcribe_sys.rs
+  s_856d96ced151b5::t_c7ed4d6327ee90 22,1572-1600
+bindings/rust/transcribe-cpp/src/family.rs
+  s_856d96ced151b5::t_b62a1eea9daab0 43-60,200,223-228,238-240,274-301
+bindings/rust/transcribe-cpp/src/lib.rs
+  s_856d96ced151b5::t_b0acc046b9d2f0 75
+ggml/CMakeLists.txt
+  s_856d96ced151b5::t_85494a6d37868e 231-232
+ggml/UPSTREAM
+  s_887b60ee8d76bb::t_6cd7ac3fd002c9 8
+ggml/src/ggml-metal/ggml-metal-device.m
+  s_856d96ced151b5::t_42230c508175e0 941-943,998,1018-1022,1052,1056,1454-1458
+ggml/src/ggml-vulkan/CMakeLists.txt
+  s_856d96ced151b5::t_a071a1c614f235 215-225,243,245,264,267
+ggml/src/ggml-vulkan/ggml-vulkan.cpp
+  s_856d96ced151b5::t_675d72af75a141 2,584-586,15328-15360,15365-15368
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+  s_856d96ced151b5::t_d21a08eaf50685 80-90,446-460,475-479,1310-1323,1465-1481
+include/transcribe/parakeet.h
+  s_856d96ced151b5::t_0c79d77a8904c9 108-159
+patches/ggml/0005-vulkan-shader-subset.patch
+  s_887b60ee8d76bb::t_e6a4d29d9be506 1-225
+src/CMakeLists.txt
+  s_856d96ced151b5::t_6097b655caa806 49
+src/arch/parakeet/decoder.cpp
+  s_856d96ced151b5::t_bb9cf14c5245ce 20,47-48,1026-1027,1174-1176,1232-1235,1268-1269,1387-1389,1418-1421,1441-1442,1556-1558,1582-1585,1714-3268
+src/arch/parakeet/decoder.h
+  s_856d96ced151b5::t_6e1807c3c620f6 38-41,210-241,262-263,275-276,293-297,311-355
+src/arch/parakeet/model.cpp
+  s_856d96ced151b5::t_c5e3f2b36af007 392-469,667-670,906-921,928,931-942,952-958,2908,3302,3562-3564,3588-3590,3905-3909,3990-3994,4022,4029-4032,4083-4092
+src/arch/parakeet/parakeet.h
+  s_856d96ced151b5::t_b363c429b7de1a 18,339-343
+src/arch/parakeet/vocabulary.cpp
+  s_856d96ced151b5::t_8cc12e5b540233 1-689
+src/arch/parakeet/vocabulary.h
+  s_856d96ced151b5::t_380f70572a7b3d 1-201
+src/transcribe-asr.cpp
+  s_856d96ced151b5::t_c4c64874fc22f3 1029-1036,1075-1078,1088
+tests/CMakeLists.txt
+  s_856d96ced151b5::t_0b0b6e266fb669 221-226
+tests/parakeet_vocabulary_unit.cpp
+  s_856d96ced151b5::t_6e5578d592c63c 1-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.7",
+  "base_commit_sha": "fd38db2f99fcfe94d6b60cd59d18e90bcf487e1a",
+  "prompts": {},
+  "sessions": {
+    "s_856d96ced151b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44e2cc2d-d87e-4bc3-a895-ee8bce7af4ed",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Eric Hayes <eqhayes@protonmail.com>"
+    },
+    "s_887b60ee8d76bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9e9b51ec-ecaa-4647-8472-ade106583950",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Eric Hayes <eqhayes@protonmail.com>"
+    }
+  }
+}
