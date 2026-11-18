@@ -1,0 +1,59 @@
+bindings/rust/sys/src/transcribe_sys.rs
+  s_856d96ced151b5::t_6bceab2564f8e0 22,1572-1600
+bindings/rust/transcribe-cpp/src/family.rs
+  s_856d96ced151b5::t_271abc72d81895 43-60,200,223-228,238-240,274-301
+bindings/rust/transcribe-cpp/src/lib.rs
+  s_856d96ced151b5::t_a0a2e1e94dbc29 75
+ggml/CMakeLists.txt
+  s_856d96ced151b5::t_de262596de460c 231-232
+ggml/UPSTREAM
+  s_856d96ced151b5::t_d401ca688cfa6a 8
+ggml/src/ggml-metal/ggml-metal-device.m
+  s_856d96ced151b5::t_d4e7c053a0275c 941-943,998,1018-1022,1052,1056,1454-1458
+ggml/src/ggml-vulkan/CMakeLists.txt
+  s_856d96ced151b5::t_876abf54510c49 215-225,243,245,264,267
+ggml/src/ggml-vulkan/ggml-vulkan.cpp
+  s_856d96ced151b5::t_5bf6a0d35f6cb1 2,584-586,15328-15360,15365-15368
+ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+  s_856d96ced151b5::t_4d8890a6649ec9 80-90,446-460,475-479,1310-1323,1465-1481
+include/transcribe/parakeet.h
+  s_856d96ced151b5::t_facbd03c1bdc88 108-159
+patches/ggml/0005-vulkan-shader-subset.patch
+  s_856d96ced151b5::t_c18544535ab2e8 1-225
+src/CMakeLists.txt
+  s_856d96ced151b5::t_ee45672caa80d4 49
+src/arch/parakeet/decoder.cpp
+  s_856d96ced151b5::t_f498b5e4ac8d56 20,47-48,1026-1027,1174-1176,1232-1235,1268-1269,1387-1389,1418-1421,1441-1442,1556-1558,1582-1585,1714-3268
+src/arch/parakeet/decoder.h
+  s_856d96ced151b5::t_2cda9b4dbf82d0 38-41,210-241,262-263,275-276,293-297,311-355
+src/arch/parakeet/model.cpp
+  s_856d96ced151b5::t_cef7527e1e8873 392-469,667-670,906-921,928,931-942,952-958,2908,3302,3562-3564,3588-3590,3905-3909,3990-3994,4022,4029-4032,4083-4092
+src/arch/parakeet/parakeet.h
+  s_856d96ced151b5::t_86724ca253007a 18,339-343
+src/arch/parakeet/vocabulary.cpp
+  s_856d96ced151b5::t_6bc37e55ca96ab 1-689
+src/arch/parakeet/vocabulary.h
+  s_856d96ced151b5::t_466d2a26a4bae3 1-201
+src/transcribe-asr.cpp
+  s_856d96ced151b5::t_fc17cabd802e0e 1029-1036,1075-1078,1088
+tests/CMakeLists.txt
+  s_856d96ced151b5::t_26d74a95ce0440 221-226
+tests/parakeet_vocabulary_unit.cpp
+  s_856d96ced151b5::t_25fdd6d28403af 1-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.7",
+  "base_commit_sha": "0d4dfaf342c08918116c2b0b367dd74d4dc8f6a4",
+  "prompts": {},
+  "sessions": {
+    "s_856d96ced151b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "44e2cc2d-d87e-4bc3-a895-ee8bce7af4ed",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Eric Hayes <eqhayes@protonmail.com>"
+    }
+  }
+}
