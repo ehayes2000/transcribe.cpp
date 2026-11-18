@@ -1,0 +1,29 @@
+bindings/rust/sys/src/transcribe_sys.rs
+  s_eac9f71a8be09f::t_ec07122c9da1d4 1580,1598-1599
+bindings/rust/transcribe-cpp/src/family.rs
+  s_eac9f71a8be09f::t_d6541401827649 59-61,281
+include/transcribe/parakeet.h
+  s_eac9f71a8be09f::t_6da7634de4938e 148-152,160,163
+src/arch/parakeet/model.cpp
+  s_eac9f71a8be09f::t_01a374eb9d3ebf 912-916
+src/arch/parakeet/vocabulary.cpp
+  s_eac9f71a8be09f::t_7aa9610594c617 269-270
+src/arch/parakeet/vocabulary.h
+  s_eac9f71a8be09f::t_6556f018a4261a 105-106
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.7",
+  "base_commit_sha": "5c0630bcfb87c6f0fbd839569ffb14d9e55ac715",
+  "prompts": {},
+  "sessions": {
+    "s_eac9f71a8be09f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9cda78dc-c30c-472e-8c92-4539ce939954",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Eric Hayes <eqhayes@protonmail.com>"
+    }
+  }
+}
