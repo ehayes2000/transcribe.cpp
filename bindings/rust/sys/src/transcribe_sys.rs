@@ -1577,6 +1577,7 @@ pub struct transcribe_parakeet_vocabulary_ext {
     pub sounds_like: *const *const ::std::os::raw::c_char,
     pub sounds_like_term: *const i32,
     pub n_sounds_like: i32,
+    pub rescore: i32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -1594,6 +1595,8 @@ const _: () = {
         [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, sounds_like_term) - 32usize];
     ["Offset of field: transcribe_parakeet_vocabulary_ext::n_sounds_like"]
         [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, n_sounds_like) - 40usize];
+    ["Offset of field: transcribe_parakeet_vocabulary_ext::rescore"]
+        [::std::mem::offset_of!(transcribe_parakeet_vocabulary_ext, rescore) - 44usize];
 };
 unsafe extern "C" {
     pub fn transcribe_parakeet_vocabulary_ext_init(ext: *mut transcribe_parakeet_vocabulary_ext);

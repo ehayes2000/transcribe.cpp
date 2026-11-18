@@ -909,9 +909,11 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
             return st;
         }
     }
-    // RNN-T models bias inside the decoder (decode_rnnt_tree); TDT models
-    // rescore the greedy transcript afterwards.
-    const bool tree_mode = vocabulary.active() && pm->host_decoder.head_kind == HostHeadKind::RNNT;
+    // RNN-T models bias inside the decoder (decode_rnnt_tree) unless the
+    // caller asks to rescore; TDT models rescore the greedy transcript
+    // afterwards.
+    const bool tree_mode =
+        vocabulary.active() && !vocabulary.rescore && pm->host_decoder.head_kind == HostHeadKind::RNNT;
     TreeOptions tree_options;
     tree_options.skeleton_boost = vocabulary.boost;
     tree_options.boost          = vocabulary.boost * k_tree_boost_ratio;

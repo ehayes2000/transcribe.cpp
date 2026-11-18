@@ -56,6 +56,9 @@ pub struct ParakeetVocabularyOptions {
     /// Extra spellings the transcript may show for a term, as
     /// `(index into RunOptions::vocabulary, spelling)`.
     pub sounds_like: Vec<(usize, String)>,
+    /// Offline RNN-T runs rescore after the greedy decode (as TDT heads and
+    /// streams do) instead of decoding the terms in the vocabulary tree.
+    pub rescore: bool,
 }
 
 /// Moonshine-streaming stream-extension knobs (stream slot).
@@ -275,6 +278,7 @@ impl RunExtension {
                 let mut ext: sys::transcribe_parakeet_vocabulary_ext = unsafe { std::mem::zeroed() };
                 unsafe { sys::transcribe_parakeet_vocabulary_ext_init(&mut ext) };
                 set(&mut ext.boost, o.boost);
+                ext.rescore = i32::from(o.rescore);
                 let spellings = o
                     .sounds_like
                     .iter()

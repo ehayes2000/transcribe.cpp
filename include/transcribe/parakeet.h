@@ -145,6 +145,11 @@ TRANSCRIBE_API void transcribe_parakeet_buffered_stream_ext_init(struct transcri
  *                shorter spellings are ignored, since one letter is too
  *                little to tell a declared mishearing from an ordinary
  *                word.
+ *   rescore      Nonzero: an offline RNN-T run rescores after its greedy
+ *                decode, as TDT heads and streams do (a span replaced only
+ *                where it sounds like a term and the term outscores it),
+ *                instead of decoding the terms alongside it in the tree.
+ *                Zero (the default): the tree.
  */
 struct transcribe_parakeet_vocabulary_ext {
     struct transcribe_ext ext;
@@ -152,9 +157,10 @@ struct transcribe_parakeet_vocabulary_ext {
     const char * const *  sounds_like;
     const int32_t *       sounds_like_term;
     int32_t               n_sounds_like;
+    int32_t               rescore;
 };
 
-/* Fills ext.size/kind, boost = -1 (family default), and no spellings. */
+/* Fills ext.size/kind, boost = -1 (family default), no spellings, and rescore = 0. */
 TRANSCRIBE_API void transcribe_parakeet_vocabulary_ext_init(struct transcribe_parakeet_vocabulary_ext * ext);
 
 #ifdef __cplusplus

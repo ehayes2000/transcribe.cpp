@@ -102,6 +102,8 @@ struct VocabularyTree {
 
 struct VocabularyBias {
     float                           boost = 0.0f;
+    // Offline RNN-T runs rescore after the greedy decode instead of the tree.
+    bool                            rescore = false;
     std::vector<VocabularyTerm>     terms;
     std::vector<VocabularySpelling> spellings;
     VocabularyTree                  tree;

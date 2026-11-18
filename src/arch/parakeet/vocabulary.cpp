@@ -266,7 +266,8 @@ transcribe_status compile_vocabulary(const Tokenizer &             tok,
             return TRANSCRIBE_ERR_INVALID_ARG;
         }
     }
-    out.boost = (ext != nullptr && ext->boost >= 0.0f) ? ext->boost : k_vocab_default_boost;
+    out.boost   = (ext != nullptr && ext->boost >= 0.0f) ? ext->boost : k_vocab_default_boost;
+    out.rescore = ext != nullptr && ext->rescore != 0;
     if (params->vocabulary == nullptr || params->n_vocabulary <= 0 || out.boost <= 0.0f) {
         return TRANSCRIBE_OK;
     }
